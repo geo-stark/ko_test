@@ -64,11 +64,6 @@ static int ht_init(void)
 	return 0;
 }
 
-static void ht_destroy(void)
-{
-	kfree(ht_table);
-}
-
 static struct ht_item *ht_find_item(int key)
 {
 	struct ht_item *item;
@@ -135,6 +130,13 @@ static void ht_del_items(void)
 
 	hash_for_each_safe(ht_table, bkt, tmp, pos, entry)
 		hash_del(&pos->entry);
+}
+
+static void ht_destroy(void)
+{
+	ht_del_items();
+	kfree(ht_table);
+	ht_table = NULL;
 }
 
 static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -264,19 +266,29 @@ static int init_sysfs(void)
 		return -ENOMEM;
 
 	res = sysfs_create_file(sysfs_root_dir, &delete_attr.attr);
-	if (res != 0)
+	if (res != 0) {
 		pr_err("sysfs_create_file(delete_attr) failed\n");
+		return res;
+	}
 	res = sysfs_create_file(sysfs_root_dir, &add_attr.attr);
-	if (res != 0)
+	if (res != 0) {
 		pr_err("sysfs_create_file(add_attr) failed\n");
+		return res;
+	}
 	res = sysfs_create_file(sysfs_root_dir, &set_attr.attr);
-	if (res != 0)
+	if (res != 0) {
 		pr_err("sysfs_create_file(set_attr) failed\n");
+		return res;
+	}
 	return 0;
 }
 
 static void destroy_sysfs(void)
 {
+	sysfs_remove_file(sysfs_root_dir, &delete_attr.attr);
+	sysfs_remove_file(sysfs_root_dir, &add_attr.attr);
+	sysfs_remove_file(sysfs_root_dir, &set_attr.attr);
+	
 	kobject_put(sysfs_items_dir);
 	kobject_put(sysfs_root_dir);
 }
@@ -299,17 +311,17 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 
 	arg_user = (void __user *)argp;
 	switch (cmd) {
-	case KO_TEST_IOCTL_VERSION:	{
+	case KO_TEST_IOCTL_VERSION: {
 		char data[KO_TEST_MAX_VERSION_SIZE];
 		sprintf(data, "%s-%s", DEVICE_NAME, THIS_MODULE->version);
-		if (copy_to_user(arg_user, data, strlen(data) + 1))
+		if (copy_to_user(arg_user, data, strlen(data) + 1) != 0)
 			return -EFAULT;
-		break;
+		return 0;
 	}
-	case KO_TEST_IOCTL_ADD:	{
+	case KO_TEST_IOCTL_ADD: {
 		ko_test_node node;
 
-		if (copy_from_user(&node, arg_user, sizeof(node)))
+		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
 			return -EFAULT;
 
 		mutex_lock(&data_lock);
@@ -317,11 +329,11 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 		mutex_unlock(&data_lock);
 		return res;
 	}
-	case KO_TEST_IOCTL_GET:	{
+	case KO_TEST_IOCTL_GET: {
 		ko_test_node node;
 		struct ht_item *item;
 
-		if (copy_from_user(&node, arg_user, sizeof(node)))
+		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
 			return -EFAULT;
 
 		mutex_lock(&data_lock);
@@ -332,7 +344,7 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 		}
 		mutex_unlock(&data_lock);
 		if (item != NULL) {
-			if (copy_to_user(arg_user, &node, sizeof(node)))
+			if (copy_to_user(arg_user, &node, sizeof(node)) != 0)
 				return -EFAULT;
 			return 0;
 		}
@@ -340,9 +352,8 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 	}
 	case KO_TEST_IOCTL_DEL: {
 		ko_test_node node;
-		int res;
 
-		if (copy_from_user(&node, arg_user, sizeof(node)))
+		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
 			return -EFAULT;
 
 		mutex_lock(&data_lock);
@@ -350,16 +361,15 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 		mutex_unlock(&data_lock);
 		return res;
 	}
-	break;
 	case KO_TEST_IOCTL_COUNT: {
 		int count = 0;
 		mutex_lock(&data_lock);
 		count = item_count;
 		mutex_unlock(&data_lock);
 
-		if (copy_to_user(arg_user, &count, sizeof(int)))
+		if (copy_to_user(arg_user, &count, sizeof(int)) != 0)
 			return -EFAULT;
-		break;
+		return 0;
 	}
 	default:
 		return -EINVAL;
@@ -383,8 +393,10 @@ static int device_release(struct inode *inode, struct file *file)
 
 static int __init ko_test_init(void)
 {
+	int res = 0;
+	
 	pr_info("started, hash table size: %u\n", hash_table_size);
-
+	
 	major_number = register_chrdev(0, DEVICE_NAME, &file_ops);
 	if (major_number < 0) {
 		pr_err("failed to register a major number\n");
@@ -393,33 +405,49 @@ static int __init ko_test_init(void)
 
 	// Register the device class
 	self_class = class_create(THIS_MODULE, CLASS_NAME);
-	if (IS_ERR(self_class)) {
+	if (IS_ERR_OR_NULL(self_class)) {
 		// Check for error and clean up if there is
 		unregister_chrdev(major_number, DEVICE_NAME);
 		pr_err("failed to register device class\n");
-		return 0;
+		return -ENOMEM;
 	}
 	// Register the device driver
 	self_device = device_create(self_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
-	if (IS_ERR(self_device)) {
+	if (IS_ERR_OR_NULL(self_device)) {
 		class_destroy(self_class);
 		unregister_chrdev(major_number, DEVICE_NAME);
 		pr_err("failed to create the device\n");
-		return 0;
+		return -ENOMEM;
 	}
 
-	ht_init();
+	res = ht_init();
+	if (res < 0) {
+		device_destroy(self_class, MKDEV(major_number, 0));
+		class_destroy(self_class);
+		unregister_chrdev(major_number, DEVICE_NAME);
+		pr_err("failed to create hash table\n");
+		return res; 
+	}
 	mutex_init(&data_lock);
-	init_sysfs();
+	res = init_sysfs();
+	if (res < 0) {
+		mutex_destroy(&data_lock);
+		ht_destroy();
+		device_destroy(self_class, MKDEV(major_number, 0));
+		class_destroy(self_class);
+		unregister_chrdev(major_number, DEVICE_NAME);
+		pr_err("failed to create hash table\n");
+		return res; 
+	}
+
 	return 0;
 }
 
 static void __exit ko_test_exit(void)
 {
 	destroy_sysfs();
-	mutex_destroy(&data_lock);
-	ht_del_items();
 	ht_destroy();
+	mutex_destroy(&data_lock);
 	device_destroy(self_class, MKDEV(major_number, 0));
 	class_destroy(self_class);
 	unregister_chrdev(major_number, DEVICE_NAME);
@@ -435,6 +463,5 @@ MODULE_DESCRIPTION("Test to get a job)");
 MODULE_VERSION("0.1");
 
 // TODO:
-// better error handling dureing module load
 // move to string key /value
 // required Kernel 3.7+ at least
