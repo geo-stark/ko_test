@@ -13,6 +13,9 @@
 #define DEVICE_NAME "ko_test_device"
 #define CLASS_NAME  "ko_test_class"
 
+#undef  pr_fmt
+#define pr_fmt(fmt) DEVICE_NAME ": " fmt
+
 #define DEFAULT_HASH_TABLE_SIZE 4096
 static unsigned int hash_table_size = DEFAULT_HASH_TABLE_SIZE;
 
@@ -100,7 +103,7 @@ static int ht_add_item(const ko_test_node *node)
 	item->attr.show = item_show;
 	res = sysfs_create_file(sysfs_items_dir, &item->attr.attr);
 	if (res != 0)
-		printk(DEVICE_NAME ": sysfs_create_file failed\n");
+		pr_err("sysfs_create_file failed\n");
 
 	item_count++;
 
@@ -262,13 +265,13 @@ static int init_sysfs(void)
 
 	res = sysfs_create_file(sysfs_root_dir, &delete_attr.attr);
 	if (res != 0)
-		printk(DEVICE_NAME ": sysfs_create_file(delete_attr) failed\n");
+		pr_err("sysfs_create_file(delete_attr) failed\n");
 	res = sysfs_create_file(sysfs_root_dir, &add_attr.attr);
 	if (res != 0)
-		printk(DEVICE_NAME ": sysfs_create_file(add_attr) failed\n");
+		pr_err("sysfs_create_file(add_attr) failed\n");
 	res = sysfs_create_file(sysfs_root_dir, &set_attr.attr);
 	if (res != 0)
-		printk(DEVICE_NAME ": sysfs_create_file(set_attr) failed\n");
+		pr_err("sysfs_create_file(set_attr) failed\n");
 	return 0;
 }
 
@@ -380,31 +383,28 @@ static int device_release(struct inode *inode, struct file *file)
 
 static int __init ko_test_init(void)
 {
-	printk(DEVICE_NAME " started, hash table size: %u\n", hash_table_size);
+	pr_info("started, hash table size: %u\n", hash_table_size);
 
 	major_number = register_chrdev(0, DEVICE_NAME, &file_ops);
 	if (major_number < 0) {
-		printk(DEVICE_NAME ": failed to register a major number\n");
+		pr_err("failed to register a major number\n");
 		return major_number;
 	}
-	printk(DEVICE_NAME ": registered correctly with major number %d\n", major_number);
 
 	// Register the device class
 	self_class = class_create(THIS_MODULE, CLASS_NAME);
 	if (IS_ERR(self_class)) {
 		// Check for error and clean up if there is
 		unregister_chrdev(major_number, DEVICE_NAME);
-		printk(DEVICE_NAME ": failed to register device class\n");
+		pr_err("failed to register device class\n");
 		return 0;
 	}
-	printk(DEVICE_NAME ": device class registered correctly\n");
-
 	// Register the device driver
 	self_device = device_create(self_class, NULL, MKDEV(major_number, 0), NULL, DEVICE_NAME);
 	if (IS_ERR(self_device)) {
 		class_destroy(self_class);
 		unregister_chrdev(major_number, DEVICE_NAME);
-		printk(DEVICE_NAME ": failed to create the device\n");
+		pr_err("failed to create the device\n");
 		return 0;
 	}
 
@@ -423,7 +423,7 @@ static void __exit ko_test_exit(void)
 	device_destroy(self_class, MKDEV(major_number, 0));
 	class_destroy(self_class);
 	unregister_chrdev(major_number, DEVICE_NAME);
-	printk(DEVICE_NAME " stopped\n");
+	pr_info("stopped\n");
 }
 
 module_init(ko_test_init);
@@ -436,6 +436,5 @@ MODULE_VERSION("0.1");
 
 // TODO:
 // better error handling dureing module load
-// move from printk to pr_* / debugfs
 // move to string key /value
 // required Kernel 3.7+ at least
