@@ -48,7 +48,8 @@ static struct hlist_head *ht_table;
 #undef HASH_SIZE
 #define HASH_SIZE(x) ht_array_size
 
-static int ht_init(void) {
+static int ht_init(void)
+{
 	unsigned int i;
 	
 	ht_array_size = 1 << fls(hash_table_size);
@@ -60,11 +61,13 @@ static int ht_init(void) {
 	return 0;
 }
 
-static void ht_destroy(void) {
+static void ht_destroy(void)
+{
 	kfree(ht_table);
 }
 
-static struct ht_item *ht_find_item(int key) {
+static struct ht_item *ht_find_item(int key)
+{
 	struct ht_item *item;
 	hash_for_each_possible(ht_table, item, entry, key) {
 		if (item->key == key)
@@ -73,7 +76,8 @@ static struct ht_item *ht_find_item(int key) {
 	return NULL;
 }
 
-static int ht_add_item(const ko_test_node *node) {
+static int ht_add_item(const ko_test_node *node)
+{
 	struct ht_item *item;
 	int res;
 
@@ -103,7 +107,8 @@ static int ht_add_item(const ko_test_node *node) {
 	return 0;
 }
 
-static int ht_del_item(int key) {
+static int ht_del_item(int key)
+{
 	struct ht_item *item;
 
 	item = ht_find_item(key);
@@ -119,7 +124,8 @@ static int ht_del_item(int key) {
 	return 0;
 }
 
-static void ht_del_items(void) {
+static void ht_del_items(void)
+{
 	struct ht_item *pos;
 	struct hlist_node *tmp;
 	int bkt;
@@ -129,7 +135,8 @@ static void ht_del_items(void) {
 }
 
 static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
-						 char *buf) {
+						 char *buf)
+{
 	struct ht_item *item;
 	ssize_t res = -ENOENT;
 	int key;
@@ -145,7 +152,8 @@ static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
-						  const char *buf, size_t count) {
+						  const char *buf, size_t count)
+{
 	struct ht_item *item;
 	ssize_t res = -ENOENT;
 	int key;
@@ -160,7 +168,8 @@ static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static ssize_t set_store(struct kobject *kobj, struct kobj_attribute *attr,
-						 const char *buf, size_t count) {
+						 const char *buf, size_t count)
+{
 	struct ht_item *item;
 	ssize_t res = -ENOENT;
 	ko_test_node node;
@@ -192,7 +201,8 @@ static struct kobj_attribute set_attr = {
 };
 
 static ssize_t add_store(struct kobject *kobj, struct kobj_attribute *attr,
-						 const char *buf, size_t count) {
+						 const char *buf, size_t count)
+{
 	ssize_t res = -ENOENT;
 	ko_test_node node;
 
@@ -215,7 +225,8 @@ static struct kobj_attribute add_attr = {
 };
 
 static ssize_t delete_store(struct kobject *kobj, struct kobj_attribute *attr,
-						 const char *buf, size_t count) {
+						 const char *buf, size_t count)
+{
 	ssize_t res = -ENOENT;
 	int key;
 
@@ -237,7 +248,8 @@ static struct kobj_attribute delete_attr = {
 	.store = delete_store,
 };
 
-static int init_sysfs(void) {
+static int init_sysfs(void)
+{
 	int res;
 
 	sysfs_root_dir = kobject_create_and_add("data", &self_device->kobj);
@@ -260,7 +272,8 @@ static int init_sysfs(void) {
 	return 0;
 }
 
-static void destroy_sysfs(void) {
+static void destroy_sysfs(void)
+{
 	kobject_put(sysfs_items_dir);
 	kobject_put(sysfs_root_dir);
 }
@@ -273,9 +286,11 @@ static struct file_operations file_ops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = device_unlocked_ioctl,
 	.open = device_open,
-	.release = device_release};
+	.release = device_release
+};
 
-static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned long argp) {
+static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned long argp)
+{
 	void __user *arg_user;
 	int res;
 
@@ -349,19 +364,22 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 	return 0;
 }
 
-static int device_open(struct inode *inode, struct file *file) {
+static int device_open(struct inode *inode, struct file *file)
+{
 	if (device_open_count)
 		return -EBUSY;
 	device_open_count++;
 	return 0;
 }
 
-static int device_release(struct inode *inode, struct file *file) {
+static int device_release(struct inode *inode, struct file *file)
+{
 	device_open_count--;
 	return 0;
 }
 
-static int __init ko_test_init(void) {
+static int __init ko_test_init(void)
+{
 	printk(DEVICE_NAME " started, hash table size: %u\n", hash_table_size);
 
 	major_number = register_chrdev(0, DEVICE_NAME, &file_ops);
@@ -396,7 +414,8 @@ static int __init ko_test_init(void) {
 	return 0;
 }
 
-static void __exit ko_test_exit(void) {
+static void __exit ko_test_exit(void)
+{
 	destroy_sysfs();
 	mutex_destroy(&data_lock);
 	ht_del_items();
