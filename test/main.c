@@ -93,6 +93,41 @@ static int cmd_del(int fd, int argc, char **argv)
 	return 0;
 }
 
+static int cmd_read(int fd, int argc, char **argv)
+{
+	ko_test_node node;
+	int ret;
+
+	ret = ioctl(fd, KO_TEST_IOCTL_READ_BEGIN);
+	if (ret < 0)
+	{
+		perror("ioctl - KO_TEST_IOCTL_READ_BEGIN");
+		return -1;
+	}
+
+	int index = 0;
+	for (;;)
+	{
+		ret = ioctl(fd, KO_TEST_IOCTL_READ_NEXT, &node);
+		if (ret < 0 && errno == ENOENT)
+			break;
+		if (ret < 0)	
+		{
+			perror("ioctl - KO_TEST_IOCTL_READ_NEXT");
+			break;
+		}
+		printf("#%d: %d - %d\n", index, node.key, node.value);
+		index++;
+	}	
+	ret = ioctl(fd, KO_TEST_IOCTL_READ_END);
+	if (ret < 0)
+	{
+		perror("ioctl - KO_TEST_IOCTL_READ_END");
+		return -1;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int fd, arg_int, ret;
@@ -104,7 +139,7 @@ int main(int argc, char **argv)
 		perror("open");
 		return EXIT_FAILURE;
 	}
-
+	
 	char version[KO_TEST_MAX_VERSION_SIZE] = "";
 	ret = ioctl(fd, KO_TEST_IOCTL_VERSION, version);
 	if (ret == -1)
@@ -126,15 +161,22 @@ int main(int argc, char **argv)
 	if (argc > 1)
 	{
 		int res;
+		const char *command = argv[1];
+		argc -= 2;
+		argv += 2;
 
-		if (strcmp(argv[1], "add") == 0)
-			res = cmd_add(fd, argc - 2, argv + 2);
-		else if (strcmp(argv[1], "del") == 0)
-			res = cmd_del(fd, argc - 2, argv + 2);
-		else if (strcmp(argv[1], "get") == 0)
-			res = cmd_get(fd, argc - 2, argv + 2);
+		if (strcmp(command, "add") == 0)
+			res = cmd_add(fd, argc, argv);
+		else if (strcmp(command, "del") == 0)
+			res = cmd_del(fd, argc, argv);
+		else if (strcmp(command, "get") == 0)
+			res = cmd_get(fd, argc, argv);
+		else if (strcmp(command, "read") == 0)
+			res = cmd_read(fd, argc, argv);
 		else
-			printf("unknown command: %s\n", argv[1]);
+			printf("unknown command: %s\n", command);
+		if (res != 0)
+			printf("command %s execution failed\n",command);
 	}
 
 	close(fd);

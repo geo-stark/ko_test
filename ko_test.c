@@ -26,7 +26,8 @@ static unsigned int item_count;
 static struct class *self_class;
 static struct device *self_device;
 static int major_number;
-static int device_open_count;
+static bool device_write_locked;
+//static int device_open_count;
 static DEFINE_MUTEX(data_lock);
 static struct kobject *sysfs_root_dir;
 static struct kobject *sysfs_items_dir;
@@ -34,6 +35,12 @@ static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
 						 char *buf);
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
 						  const char *buf, size_t count);
+
+struct file_data {
+	bool locked;
+	int bucket;
+	struct ht_item *pos;
+};
 
 struct ht_item {
 	int key;
@@ -79,6 +86,9 @@ static int ht_add_item(const ko_test_node *node)
 	struct ht_item *item;
 	int res;
 
+	if (device_write_locked)
+		return -EAGAIN;
+
 	item = ht_find_item(node->key);
 	if (item != NULL)
 		return -EEXIST;
@@ -109,6 +119,9 @@ static int ht_del_item(int key)
 {
 	struct ht_item *item;
 
+	if (device_write_locked)
+		return -EAGAIN;
+
 	item = ht_find_item(key);
 	if (item == NULL)
 		return -ENOENT;
@@ -126,7 +139,7 @@ static void ht_del_items(void)
 {
 	struct ht_item *pos;
 	struct hlist_node *tmp;
-	int bkt;
+	unsigned int bkt;
 
 	hash_for_each_safe(ht_table, bkt, tmp, pos, entry)
 		hash_del(&pos->entry);
@@ -137,6 +150,42 @@ static void ht_destroy(void)
 	ht_del_items();
 	kfree(ht_table);
 	ht_table = NULL;
+}
+
+struct ht_item *ht_read_init(int *bkt_in, struct ht_item **item_in)
+{
+	int bkt;
+	struct ht_item *item;
+
+	hash_for_each(ht_table, bkt, item, entry) {
+		*bkt_in = bkt;
+		*item_in = item;
+		return item;
+	}
+	return NULL;
+}
+
+struct ht_item *ht_read_next(int *bkt_in, struct ht_item **item_in)
+{
+	int bkt;
+	struct ht_item *item;
+
+	item = *item_in;
+	hlist_for_each_entry_continue(item, entry) {
+		*item_in = item;
+		return item;
+	}
+
+	for (bkt = *bkt_in + 1; bkt < HASH_SIZE(ht_table); bkt++) {
+		hlist_for_each_entry(item, &ht_table[bkt], entry) {
+			*bkt_in = bkt;
+			*item_in = item;
+			return item;
+		}
+	}
+	*bkt_in = bkt;
+	*item_in = NULL;
+	return NULL;
 }
 
 static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -253,6 +302,20 @@ static struct kobj_attribute delete_attr = {
 	.store = delete_store,
 };
 
+static ssize_t locked_show(struct kobject *kobj, struct kobj_attribute *attr,
+						char *buf)
+{
+	return sprintf(buf, "%s\n", device_write_locked ? "1" : "0");
+}
+
+static struct kobj_attribute locked_attr = {
+	.attr = {
+		.name = "locked",
+		.mode = 0400
+	},
+	.show = locked_show,
+};
+
 static int init_sysfs(void)
 {
 	int res;
@@ -280,6 +343,11 @@ static int init_sysfs(void)
 		pr_err("sysfs_create_file(set_attr) failed\n");
 		return res;
 	}
+	res = sysfs_create_file(sysfs_root_dir, &locked_attr.attr);
+	if (res != 0) {
+		pr_err("sysfs_create_file(locked_attr) failed\n");
+		return res;
+	}
 	return 0;
 }
 
@@ -288,6 +356,7 @@ static void destroy_sysfs(void)
 	sysfs_remove_file(sysfs_root_dir, &delete_attr.attr);
 	sysfs_remove_file(sysfs_root_dir, &add_attr.attr);
 	sysfs_remove_file(sysfs_root_dir, &set_attr.attr);
+	sysfs_remove_file(sysfs_root_dir, &locked_attr.attr);
 	
 	kobject_put(sysfs_items_dir);
 	kobject_put(sysfs_root_dir);
@@ -304,11 +373,13 @@ static struct file_operations file_ops = {
 	.release = device_release
 };
 
-static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned long argp)
+static long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long argp)
 {
+	struct file_data *fd;
 	void __user *arg_user;
-	int res;
+	int res = 0;
 
+	fd = (struct file_data *)file->private_data;
 	arg_user = (void __user *)argp;
 	switch (cmd) {
 	case KO_TEST_IOCTL_VERSION: {
@@ -318,6 +389,7 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 			return -EFAULT;
 		return 0;
 	}
+
 	case KO_TEST_IOCTL_ADD: {
 		ko_test_node node;
 
@@ -371,6 +443,49 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 			return -EFAULT;
 		return 0;
 	}
+	case KO_TEST_IOCTL_READ_BEGIN: {
+		mutex_lock(&data_lock);
+		if (device_write_locked)
+			res = -EBUSY;
+		else {
+			device_write_locked = true;
+			fd->locked = true;
+			ht_read_init(&fd->bucket, &fd->pos);
+		}
+		mutex_unlock(&data_lock);
+		return res;
+	}
+	case KO_TEST_IOCTL_READ_END: {
+		mutex_lock(&data_lock);
+		if (!fd->locked)
+			res = -EBUSY;
+		else {
+			device_write_locked = false;
+			fd->locked = false;
+		}
+		mutex_unlock(&data_lock);
+		return res;
+	}
+	case KO_TEST_IOCTL_READ_NEXT: {
+		ko_test_node node;
+
+		mutex_lock(&data_lock);
+		if (!fd->locked)
+			res = -EBUSY;
+		else {
+			if (fd->pos != NULL) {
+				node.key = fd->pos->key;
+				node.value = fd->pos->value;
+				ht_read_next(&fd->bucket, &fd->pos);
+			}
+			else
+				res = -ENOENT;
+		}
+		mutex_unlock(&data_lock);
+		if (res == 0 && copy_to_user(arg_user, &node, sizeof(node)) != 0)
+			return -EFAULT;
+		return res;
+	}
 	default:
 		return -EINVAL;
 	}
@@ -379,15 +494,27 @@ static long device_unlocked_ioctl(struct file *fl, unsigned int cmd, unsigned lo
 
 static int device_open(struct inode *inode, struct file *file)
 {
-	if (device_open_count)
-		return -EBUSY;
-	device_open_count++;
+	struct file_data *fd;
+
+	fd = kzalloc(sizeof(struct file_data), GFP_KERNEL);
+	if (fd == NULL)
+		return -ENOMEM;
+
+	file->private_data = fd;
 	return 0;
 }
 
 static int device_release(struct inode *inode, struct file *file)
 {
-	device_open_count--;
+	struct file_data *fd;
+
+	fd = (struct file_data *)file->private_data;
+	if (fd->locked)	{
+		mutex_lock(&data_lock);
+		device_write_locked = false;
+		mutex_unlock(&data_lock);
+	}
+	kfree(fd);
 	return 0;
 }
 
@@ -460,8 +587,10 @@ module_exit(ko_test_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("George Stark");
 MODULE_DESCRIPTION("Test to get a job)");
-MODULE_VERSION("0.1");
+MODULE_VERSION("0.2");
 
 // TODO:
 // move to string key /value
-// required Kernel 3.7+ at least
+// change hash function
+// try RCU
+// support block / nonblock mode, when try to change locked data
