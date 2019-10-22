@@ -27,7 +27,6 @@ static struct class *self_class;
 static struct device *self_device;
 static int major_number;
 static bool device_write_locked;
-//static int device_open_count;
 static DEFINE_MUTEX(data_lock);
 static struct kobject *sysfs_root_dir;
 static struct kobject *sysfs_items_dir;
@@ -81,7 +80,7 @@ static struct ht_item *ht_find_item(int key)
 	return NULL;
 }
 
-static int ht_add_item(const ko_test_node *node)
+static int ht_add_item(const ko_test_node *node, bool allow_replace)
 {
 	struct ht_item *item;
 	int res;
@@ -90,9 +89,12 @@ static int ht_add_item(const ko_test_node *node)
 		return -EAGAIN;
 
 	item = ht_find_item(node->key);
-	if (item != NULL)
-		return -EEXIST;
-
+	if (item != NULL) {
+		if (!allow_replace)
+			return -EEXIST;
+		item->value = node->value;
+		return 0;
+	}
 	item = kzalloc(sizeof(struct ht_item), GFP_KERNEL);
 	if (item == NULL)
 		return -ENOMEM;
@@ -208,40 +210,33 @@ static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
 						  const char *buf, size_t count)
 {
-	struct ht_item *item;
-	ssize_t res = -ENOENT;
-	int key;
+	ssize_t res;
+	ko_test_node node;
 
-	key = simple_strtol(attr->attr.name, NULL, 10);
+	if (sscanf(buf, "%d", &node.key) != 1)
+		return -ENOENT;
+
 	mutex_lock(&data_lock);
-	item = ht_find_item(key);
-	if (item != NULL && sscanf(buf, "%d", &item->value) == 1)
+	if ((res = ht_add_item(&node, true)) == 0)
 		res = count;
 	mutex_unlock(&data_lock);
 	return res;
 }
 
-static ssize_t set_store(struct kobject *kobj, struct kobj_attribute *attr,
+static ssize_t add_set_store(struct kobject *kobj, struct kobj_attribute *attr,
 						 const char *buf, size_t count)
 {
-	struct ht_item *item;
-	ssize_t res = -ENOENT;
+	ssize_t res;
+	bool allow_replace;
 	ko_test_node node;
 
 	if (sscanf(buf, "%d,%d", &node.key, &node.value) != 2)
-		return res;
+		return -ENOENT;
 
+	allow_replace = attr->attr.name[0] == 's';
 	mutex_lock(&data_lock);
-	item = ht_find_item(node.key);
-	if (item == NULL) {
-		if (ht_add_item(&node) == 0)
-			res = count;
-	}
-	else {
-		item->value = node.value;
+	if ((res = ht_add_item(&node, allow_replace)) == 0)
 		res = count;
-	}
-	
 	mutex_unlock(&data_lock);
 	return res;
 }
@@ -251,31 +246,15 @@ static struct kobj_attribute set_attr = {
 		.name = "set",
 		.mode = 0200
 	},
-	.store = set_store,
+	.store = add_set_store,
 };
-
-static ssize_t add_store(struct kobject *kobj, struct kobj_attribute *attr,
-						 const char *buf, size_t count)
-{
-	ssize_t res = -ENOENT;
-	ko_test_node node;
-
-	if (sscanf(buf, "%d,%d", &node.key, &node.value) != 2)
-		return res;
-
-	mutex_lock(&data_lock);
-	if (ht_add_item(&node) == 0)
-		res = count;
-	mutex_unlock(&data_lock);
-	return res;
-}
 
 static struct kobj_attribute add_attr = {
 	.attr = {
 		.name = "add",
 		.mode = 0200
 	},
-	.store = add_store,
+	.store = add_set_store,
 };
 
 static ssize_t delete_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -390,14 +369,18 @@ static long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned 
 		return 0;
 	}
 
+	case KO_TEST_IOCTL_SET:
 	case KO_TEST_IOCTL_ADD: {
 		ko_test_node node;
+		bool allow_replace;
+
+		allow_replace = (cmd == KO_TEST_IOCTL_SET);
 
 		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
 			return -EFAULT;
 
 		mutex_lock(&data_lock);
-		res = ht_add_item(&node);
+		res = ht_add_item(&node, allow_replace);
 		mutex_unlock(&data_lock);
 		return res;
 	}
@@ -566,7 +549,6 @@ static int __init ko_test_init(void)
 		pr_err("failed to create hash table\n");
 		return res; 
 	}
-
 	return 0;
 }
 
