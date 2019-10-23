@@ -210,10 +210,11 @@ static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
 						  const char *buf, size_t count)
 {
-	ssize_t res;
+	ssize_t res = -ENOENT;
 	ko_test_node node;
 
-	if (sscanf(buf, "%d", &node.key) != 1)
+	sscanf(attr->attr.name, "%d", &node.key);
+	if (sscanf(buf, "%d", &node.value) != 1)
 		return -ENOENT;
 
 	mutex_lock(&data_lock);
