@@ -128,10 +128,8 @@ static int ht_del_item(int key)
 	if (item == NULL)
 		return -ENOENT;
 
-	hash_del(&item->entry);
-
 	sysfs_remove_file(sysfs_items_dir, &item->attr.attr);
-
+	hash_del(&item->entry);
 	kfree(item);
 	item_count--;
 	return 0;
@@ -143,8 +141,12 @@ static void ht_del_items(void)
 	struct hlist_node *tmp;
 	unsigned int bkt;
 
-	hash_for_each_safe(ht_table, bkt, tmp, pos, entry)
+	hash_for_each_safe(ht_table, bkt, tmp, pos, entry) {
+		sysfs_remove_file(sysfs_items_dir, &pos->attr.attr);
 		hash_del(&pos->entry);
+		kfree(pos);
+	}
+	item_count = 0;
 }
 
 static void ht_destroy(void)
@@ -555,8 +557,8 @@ static int __init ko_test_init(void)
 
 static void __exit ko_test_exit(void)
 {
-	destroy_sysfs();
 	ht_destroy();
+	destroy_sysfs();
 	mutex_destroy(&data_lock);
 	device_destroy(self_class, MKDEV(major_number, 0));
 	class_destroy(self_class);
