@@ -11,12 +11,37 @@
 #include "../ko_test_ioctl.h"
 
 #define DEFAULT_DEV "/dev/ko_test_device"
+#define MAX_STRING_SIZE 32
+
+static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
 
 static void randomize()
 {
 	struct timespec tp = {0, 0};
 	clock_gettime(CLOCK_MONOTONIC, &tp);
 	srand(tp.tv_nsec);
+}
+
+static char *realloc_string(char *str, int size)
+{
+    char *ptr = realloc(str, size + 1);
+    ptr[size] = 0;
+    return ptr;
+}
+
+static void alloc_random_string(char **out_str, int *out_size)
+{
+    int i;
+    int size = (rand() % MAX_STRING_SIZE) + 1;
+    char *str = realloc_string(NULL, size);
+
+    for (i = 0; i < size; i++)
+	str[i] = alphanum[rand() % (sizeof(alphanum) - 1)];
+    *out_size = size;
+    *out_str = str;
 }
 
 static int cmd_add(int fd, int argc, char **argv)
@@ -27,13 +52,15 @@ static int cmd_add(int fd, int argc, char **argv)
 	switch (argc)
 	{
 	case 0:
-		node.key = rand();
-		node.value = rand();
-		printf("using random key-value pair: %d %d\n", node.key, node.value);
+		alloc_random_string(&node.key, &node.key_size);
+		alloc_random_string(&node.value, &node.value_size);
+		printf("using random key-value pair: %s %s\n", node.key, node.value);
 		break;
 	case 2:
-		node.key = atoi(argv[0]);
-		node.value = atoi(argv[1]);
+		node.key = argv[0];
+		node.key_size = strlen(argv[0]);
+		node.value = argv[1];
+		node.value_size = strlen(argv[1]);
 		break;
 	default:
 		printf("usage: add [<key> <value>]\n");
@@ -41,6 +68,11 @@ static int cmd_add(int fd, int argc, char **argv)
 	}
 
 	ret = ioctl(fd, KO_TEST_IOCTL_ADD, &node);
+	if (argc == 0)
+	{
+	    free(node.key);
+	    free(node.value);
+	}
 	if (ret == -1)
 	{
 		perror("ioctl - KO_TEST_IOCTL_ADD");
@@ -59,15 +91,29 @@ static int cmd_get(int fd, int argc, char **argv)
 		printf("usage: get <key>\n");
 		return -1;
 	}
+	memset(&node, 0, sizeof(node));
+	node.key = argv[0];
+	node.key_size = strlen(argv[0]);
 
-	node.key = atoi(argv[0]);
 	ret = ioctl(fd, KO_TEST_IOCTL_GET, &node);
 	if (ret == -1)
 	{
+	    if (errno != ENOSPC)
+	    {
 		perror("ioctl - KO_TEST_IOCTL_GET");
 		return -1;
+	    }
+	    node.value = realloc_string(NULL, node.value_size);
+	    ret = ioctl(fd, KO_TEST_IOCTL_GET, &node);
+	    if (ret == -1)
+	    {
+		perror("ioctl - KO_TEST_IOCTL_GET");
+		free(node.value);
+		return -1;
+	    }
 	}
-	printf("key-value pair: %d %d\n", node.key, node.value);
+	printf("key-value pair: %s %s\n", node.key, node.value);
+	free(node.value);
 	return 0;
 }
 
@@ -82,14 +128,16 @@ static int cmd_del(int fd, int argc, char **argv)
 		return -1;
 	}
 
-	node.key = atoi(argv[0]);
+	node.key = argv[0];
+	node.key_size = strlen(argv[0]);
+	
 	ret = ioctl(fd, KO_TEST_IOCTL_DEL, &node);
 	if (ret == -1)
 	{
 		perror("ioctl - KO_TEST_IOCTL_DEL");
 		return -1;
 	}
-	printf("key-value pair %d deleted\n", node.key);
+	printf("key-value pair %s deleted\n", node.key);
 	return 0;
 }
 
@@ -98,7 +146,7 @@ static int cmd_read(int fd, int argc, char **argv)
 	ko_test_node node;
 	int ret;
 
-	ret = ioctl(fd, KO_TEST_IOCTL_READ_BEGIN);
+    	ret = ioctl(fd, KO_TEST_IOCTL_READ_BEGIN);
 	if (ret < 0)
 	{
 		perror("ioctl - KO_TEST_IOCTL_READ_BEGIN");
@@ -108,16 +156,26 @@ static int cmd_read(int fd, int argc, char **argv)
 	int index = 0;
 	for (;;)
 	{
+		memset(&node, 0, sizeof(node));
 		ret = ioctl(fd, KO_TEST_IOCTL_READ_NEXT, &node);
-		if (ret < 0 && errno == ENOENT)
-			break;
-		if (ret < 0)	
+		if (ret < 0)
 		{
+		    if (errno == ENOENT)
+			break;
+		    if (errno == ENOSPC)
+		    {
+			node.key = realloc_string(node.key, node.key_size);
+			node.value = realloc_string(node.value, node.value_size);
+			ret = ioctl(fd, KO_TEST_IOCTL_READ_NEXT, &node);
+		    }
+		    if (ret < 0)
+		    {
 			perror("ioctl - KO_TEST_IOCTL_READ_NEXT");
 			break;
+		    }
+		    printf("#%d: %s - %s\n", index, node.key, node.value);
+		    index++;
 		}
-		printf("#%d: %d - %d\n", index, node.key, node.value);
-		index++;
 	}	
 	ret = ioctl(fd, KO_TEST_IOCTL_READ_END);
 	if (ret < 0)
@@ -149,15 +207,6 @@ int main(int argc, char **argv)
 	}
 	printf("module version: %s\n", version);
 
-	unsigned int node_count = 0;
-	ret = ioctl(fd, KO_TEST_IOCTL_COUNT, &node_count);
-	if (ret == -1)
-	{
-		perror("ioctl - KO_TEST_IOCTL_COUNT");
-		return EXIT_FAILURE;
-	}
-	printf("current key-value pairs count: %d\n", node_count);
-
 	if (argc > 1)
 	{
 		int res;
@@ -176,8 +225,17 @@ int main(int argc, char **argv)
 		else
 			printf("unknown command: %s\n", command);
 		if (res != 0)
-			printf("command %s execution failed\n",command);
+			printf("%s command execution failed\n",command);
 	}
+	
+	unsigned int node_count = 0;
+	ret = ioctl(fd, KO_TEST_IOCTL_COUNT, &node_count);
+	if (ret == -1)
+	{
+		perror("ioctl - KO_TEST_IOCTL_COUNT");
+		return EXIT_FAILURE;
+	}
+	printf("current key-value pairs count: %d\n", node_count);
 
 	close(fd);
 	return EXIT_SUCCESS;

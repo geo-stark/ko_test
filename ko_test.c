@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/device.h>
 #include <linux/fs.h>
+#include <linux/ctype.h>
 #include <linux/uaccess.h>
 #include <linux/hashtable.h>
 #include <linux/slab.h>
@@ -19,8 +20,8 @@
 #define DEFAULT_HASH_TABLE_SIZE 4096
 static unsigned int hash_table_size = DEFAULT_HASH_TABLE_SIZE;
 
-module_param(hash_table_size, uint, 0600);
-MODULE_PARM_DESC(hash_table_size, "Max size of hash table");
+module_param(hash_table_size, uint, 0444);
+MODULE_PARM_DESC(hash_table_size, "Min size of hash table");
 
 static unsigned int item_count;
 static struct class *self_class;
@@ -31,9 +32,9 @@ static DEFINE_MUTEX(data_lock);
 static struct kobject *sysfs_root_dir;
 static struct kobject *sysfs_items_dir;
 static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
-						 char *buf);
+						char *buf);
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
-						  const char *buf, size_t count);
+						const char *buf, size_t count);
 
 struct file_data {
 	bool locked;
@@ -42,13 +43,13 @@ struct file_data {
 };
 
 struct ht_item {
-	int key;
-	int value;
-
-	char key_str[32];
+	struct hlist_node entry;
 	struct kobj_attribute attr;
 
-	struct hlist_node entry;
+	int value_size;
+	char *value;
+	int key_size;
+	char key[];
 };
 
 static unsigned int ht_array_size;
@@ -56,6 +57,17 @@ static struct hlist_head *ht_table;
 
 #undef HASH_SIZE
 #define HASH_SIZE(x) ht_array_size
+
+// taken from http://www.cse.yorku.ca/~oz/hash.html
+static unsigned long djb2n(const char *str, int size)
+{
+	unsigned long hash = 5381;
+	int i;
+
+	for (i = 0; i < size; i++)
+		hash = ((hash << 5) + hash) + (unsigned char)str[i]; /* hash * 33 + c */
+	return hash;
+}
 
 static int ht_init(void)
 {
@@ -70,42 +82,79 @@ static int ht_init(void)
 	return 0;
 }
 
-static struct ht_item *ht_find_item(int key)
+static struct ht_item *ht_find_item(const char *key, int size, unsigned long *hash_out)
 {
 	struct ht_item *item;
-	hash_for_each_possible(ht_table, item, entry, key) {
-		if (item->key == key)
+	unsigned long hash;
+
+	hash = djb2n(key, size);
+	if (hash_out != NULL)
+		*hash_out = hash;
+
+	hash_for_each_possible(ht_table, item, entry, hash) {
+		if (item->key_size == size && memcmp(item->key, key, size) == 0)
 			return item;
 	}
 	return NULL;
+}
+static bool validate_key(const ko_test_node *node)
+{
+	int i;
+
+	for (i = 0; i < node->key_size; i++)
+		if (!isprint(node->key[i]))
+			return false;
+	return true;
+}
+
+static bool copy_value(struct ht_item *dst, const char *value, int size)
+{
+	dst->value = krealloc(dst->value, size, GFP_KERNEL);
+	if (dst->value == NULL)
+		return false;
+	memcpy(dst->value, value, size);
+	dst->value_size = size;
+	return true;
 }
 
 static int ht_add_item(const ko_test_node *node, bool allow_replace)
 {
 	struct ht_item *item;
-	int res;
+	int res, total_size;
+	unsigned long hash;
 
 	if (device_write_locked)
 		return -EAGAIN;
 
-	item = ht_find_item(node->key);
+	item = ht_find_item(node->key, node->key_size, &hash);
 	if (item != NULL) {
 		if (!allow_replace)
 			return -EEXIST;
-		item->value = node->value;
+		if (!copy_value(item, node->value, node->value_size))
+			return -ENOMEM;
 		return 0;
 	}
-	item = kzalloc(sizeof(struct ht_item), GFP_KERNEL);
+	if (!validate_key(node))
+		return -EINVAL;
+
+	total_size = sizeof(struct ht_item) + node->key_size + 1;
+	item = kzalloc(total_size, GFP_KERNEL);
 	if (item == NULL)
 		return -ENOMEM;
-	item->key = node->key;
-	item->value = node->value;
 
-	hash_add(ht_table, &item->entry, node->key);
+	if (!copy_value(item, node->value, node->value_size)) {
+		kfree(item);
+		return -ENOMEM;
+	}
+	memcpy(item->key, node->key, node->key_size);
+	item->key_size = node->key_size;
+	// key is stored null-terminated only for sysfs attr
+	item->key[item->key_size] = 0;
 
-	sprintf(item->key_str, "%d", item->key);
+	hash_add(ht_table, &item->entry, hash);
+
 	item->attr.attr.mode = 0600;
-	item->attr.attr.name = item->key_str;
+	item->attr.attr.name = item->key;
 	item->attr.store = item_store;
 	item->attr.show = item_show;
 	res = sysfs_create_file(sysfs_items_dir, &item->attr.attr);
@@ -117,19 +166,20 @@ static int ht_add_item(const ko_test_node *node, bool allow_replace)
 	return 0;
 }
 
-static int ht_del_item(int key)
+static int ht_del_item(const char *key, int size)
 {
 	struct ht_item *item;
 
 	if (device_write_locked)
 		return -EAGAIN;
 
-	item = ht_find_item(key);
+	item = ht_find_item(key, size, NULL);
 	if (item == NULL)
 		return -ENOENT;
 
-	sysfs_remove_file(sysfs_items_dir, &item->attr.attr);
 	hash_del(&item->entry);
+	sysfs_remove_file(sysfs_items_dir, &item->attr.attr);
+	kfree(item->value);
 	kfree(item);
 	item_count--;
 	return 0;
@@ -142,8 +192,9 @@ static void ht_del_items(void)
 	unsigned int bkt;
 
 	hash_for_each_safe(ht_table, bkt, tmp, pos, entry) {
-		sysfs_remove_file(sysfs_items_dir, &pos->attr.attr);
 		hash_del(&pos->entry);
+		sysfs_remove_file(sysfs_items_dir, &pos->attr.attr);
+		kfree(pos->value);
 		kfree(pos);
 	}
 	item_count = 0;
@@ -154,6 +205,21 @@ static void ht_destroy(void)
 	ht_del_items();
 	kfree(ht_table);
 	ht_table = NULL;
+}
+
+static int ht_get_deepest_collision(void)
+{
+	struct ht_item *pos;
+	unsigned int bkt, cc, tcc = 0;
+
+	for (bkt = 0; bkt < HASH_SIZE(ht_table); bkt++) {
+		cc = 0;
+		hlist_for_each_entry(pos, &ht_table[bkt], entry)
+			cc++;
+		if (tcc < cc)
+			tcc = cc;
+	}
+	return tcc;
 }
 
 struct ht_item *ht_read_init(int *bkt_in, struct ht_item **item_in)
@@ -193,31 +259,32 @@ struct ht_item *ht_read_next(int *bkt_in, struct ht_item **item_in)
 }
 
 static ssize_t item_show(struct kobject *kobj, struct kobj_attribute *attr,
-						 char *buf)
+						char *buf)
 {
 	struct ht_item *item;
 	ssize_t res = -ENOENT;
-	int key;
 
-	key = simple_strtol(attr->attr.name, NULL, 10);
 	mutex_lock(&data_lock);
-	item = ht_find_item(key);
-	if (item != NULL)
-		res = sprintf(buf, "%d\n", item->value);
+	item = ht_find_item(attr->attr.name, strlen(attr->attr.name), NULL);
+	if (item != NULL) {
+		memcpy(buf, item->value, item->value_size);
+		res = item->value_size;
+	}
 	mutex_unlock(&data_lock);
 
 	return res;
 }
 
 static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
-						  const char *buf, size_t count)
+						const char *buf, size_t count)
 {
-	ssize_t res = -ENOENT;
+	ssize_t res;
 	ko_test_node node;
 
-	sscanf(attr->attr.name, "%d", &node.key);
-	if (sscanf(buf, "%d", &node.value) != 1)
-		return -ENOENT;
+	node.key = (char*)attr->attr.name;
+	node.key_size = strlen(attr->attr.name);
+	node.value = (char*)buf;
+	node.value_size = count;
 
 	mutex_lock(&data_lock);
 	if ((res = ht_add_item(&node, true)) == 0)
@@ -226,16 +293,30 @@ static ssize_t item_store(struct kobject *kobj, struct kobj_attribute *attr,
 	return res;
 }
 
+static bool read_key_value(const char *buf, size_t count, ko_test_node *node)
+{
+	const char *end = buf + count;
+
+	node->key = (char*)buf;
+	while (buf != end)
+	if (*buf++ == '\n') {
+		node->key_size = buf - node->key - 1;
+		node->value = (char*)buf;
+		node->value_size = end - buf;
+		return true;
+	}
+	return false;
+}
+
 static ssize_t add_set_store(struct kobject *kobj, struct kobj_attribute *attr,
-						 const char *buf, size_t count)
+						const char *buf, size_t count)
 {
 	ssize_t res;
 	bool allow_replace;
 	ko_test_node node;
 
-	if (sscanf(buf, "%d,%d", &node.key, &node.value) != 2)
+	if (!read_key_value(buf, count, &node))
 		return -ENOENT;
-
 	allow_replace = attr->attr.name[0] == 's';
 	mutex_lock(&data_lock);
 	if ((res = ht_add_item(&node, allow_replace)) == 0)
@@ -264,13 +345,9 @@ static ssize_t delete_store(struct kobject *kobj, struct kobj_attribute *attr,
 						 const char *buf, size_t count)
 {
 	ssize_t res = -ENOENT;
-	int key;
-
-	if (sscanf(buf, "%d", &key) != 1)
-		return res;
 
 	mutex_lock(&data_lock);
-	if (ht_del_item(key) == 0)
+	if (ht_del_item(buf, count) == 0)
 		res = count;
 	mutex_unlock(&data_lock);
 	return res;
@@ -298,9 +375,37 @@ static struct kobj_attribute locked_attr = {
 	.show = locked_show,
 };
 
+static ssize_t collision_counter_show(struct kobject *kobj, 
+		struct kobj_attribute *attr, char *buf)
+{
+	int counter;
+
+	mutex_lock(&data_lock);
+	counter = ht_get_deepest_collision();
+	mutex_unlock(&data_lock);
+
+	return sprintf(buf, "%d\n", counter);
+}
+
+static struct kobj_attribute collision_counter_attr = {
+	.attr = {
+		.name = "collision_counter",
+		.mode = 0400
+	},
+	.show = collision_counter_show,
+};
+
+static struct kobj_attribute *sysfs_root_files[] = {
+	&delete_attr,
+	&add_attr,
+	&set_attr,
+	&locked_attr,
+	&collision_counter_attr,
+};
+
 static int init_sysfs(void)
 {
-	int res;
+	int res, i;
 
 	sysfs_root_dir = kobject_create_and_add("data", &self_device->kobj);
 	if (!sysfs_root_dir)
@@ -310,36 +415,24 @@ static int init_sysfs(void)
 	if (!sysfs_items_dir)
 		return -ENOMEM;
 
-	res = sysfs_create_file(sysfs_root_dir, &delete_attr.attr);
-	if (res != 0) {
-		pr_err("sysfs_create_file(delete_attr) failed\n");
-		return res;
-	}
-	res = sysfs_create_file(sysfs_root_dir, &add_attr.attr);
-	if (res != 0) {
-		pr_err("sysfs_create_file(add_attr) failed\n");
-		return res;
-	}
-	res = sysfs_create_file(sysfs_root_dir, &set_attr.attr);
-	if (res != 0) {
-		pr_err("sysfs_create_file(set_attr) failed\n");
-		return res;
-	}
-	res = sysfs_create_file(sysfs_root_dir, &locked_attr.attr);
-	if (res != 0) {
-		pr_err("sysfs_create_file(locked_attr) failed\n");
-		return res;
+	for (i = 0; i < ARRAY_SIZE(sysfs_root_files); i++) {
+		res = sysfs_create_file(sysfs_root_dir, &sysfs_root_files[i]->attr);
+		if (res != 0) {
+			pr_err("sysfs_create_file for %s failed\n",
+				sysfs_root_files[i]->attr.name);
+			return res;
+		}
 	}
 	return 0;
 }
 
 static void destroy_sysfs(void)
 {
-	sysfs_remove_file(sysfs_root_dir, &delete_attr.attr);
-	sysfs_remove_file(sysfs_root_dir, &add_attr.attr);
-	sysfs_remove_file(sysfs_root_dir, &set_attr.attr);
-	sysfs_remove_file(sysfs_root_dir, &locked_attr.attr);
+	int i;
 	
+	for (i = 0; i < ARRAY_SIZE(sysfs_root_files); i++)
+		sysfs_remove_file(sysfs_root_dir, &sysfs_root_files[i]->attr);
+
 	kobject_put(sysfs_items_dir);
 	kobject_put(sysfs_root_dir);
 }
@@ -354,6 +447,53 @@ static struct file_operations file_ops = {
 	.open = device_open,
 	.release = device_release
 };
+
+static int load_key_value_user(ko_test_node *node, void __user *arg_user)
+{
+	char *ptr;
+
+	if (copy_from_user(node, arg_user, sizeof(ko_test_node)) != 0)
+		return -EFAULT;
+	if (node->key_size <= 0 || node->key == NULL || node->value_size < 0)
+		return -EINVAL;
+	if ((ptr = kmalloc(node->key_size, GFP_KERNEL)) == NULL)
+		return -ENOMEM;
+	if (copy_from_user(ptr, node->key, node->key_size) != 0) {
+		kfree(node->key);
+		return -EFAULT;
+	}
+	node->key = ptr;
+
+	if (node->value != NULL) {
+		if ((ptr = kmalloc(node->value_size, GFP_KERNEL)) == NULL) {
+			kfree(node->key);
+			return -ENOMEM;
+		}
+		if (copy_from_user(ptr, node->value, node->value_size) != 0) {
+			kfree(node->key);
+			kfree(ptr);
+			return -EFAULT;
+		}
+		node->value = ptr;
+	}
+	return 0;
+}
+
+static int load_key_user(char **key, const ko_test_node *node)
+{
+	char *ptr;
+
+	if (node->key_size <= 0 || node->key == NULL || node->value_size < 0)
+		return -EINVAL;
+	if ((ptr = kmalloc(node->key_size, GFP_KERNEL)) == NULL)
+		return -ENOMEM;
+	if (copy_from_user(ptr, node->key, node->key_size) != 0) {
+		kfree(ptr);
+		return -EFAULT;
+	}
+	*key = ptr;
+	return 0;
+}
 
 static long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long argp)
 {
@@ -375,47 +515,54 @@ static long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned 
 	case KO_TEST_IOCTL_SET:
 	case KO_TEST_IOCTL_ADD: {
 		ko_test_node node;
-		bool allow_replace;
 
-		allow_replace = (cmd == KO_TEST_IOCTL_SET);
-
-		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
-			return -EFAULT;
-
+		if ((res = load_key_value_user(&node, arg_user)) != 0)
+			return res;
 		mutex_lock(&data_lock);
-		res = ht_add_item(&node, allow_replace);
+		res = ht_add_item(&node, cmd == KO_TEST_IOCTL_SET);
 		mutex_unlock(&data_lock);
+		kfree(node.key);
+		kfree(node.value);
 		return res;
 	}
 	case KO_TEST_IOCTL_GET: {
 		ko_test_node node;
 		struct ht_item *item;
+		char *key;
 
-		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
+		if (copy_from_user(&node, arg_user, sizeof(ko_test_node)) != 0)
 			return -EFAULT;
+		if ((res = load_key_user(&key, &node)) != 0)
+			return res;
 
 		mutex_lock(&data_lock);
-		item = ht_find_item(node.key);
-		if (item != NULL) {
-			node.key = item->key;
-			node.value = item->value;
+		item = ht_find_item(key, node.key_size, NULL);
+		kfree(key);
+		if (item == NULL)
+			res = -ENOENT;
+		else {
+			if (node.value_size < item->value_size)
+				res = -ENOSPC;
+			else if (copy_to_user(node.value, item->value, item->value_size) != 0)
+				res = -EFAULT;
+			node.value_size = item->value_size;
 		}
 		mutex_unlock(&data_lock);
-		if (item != NULL) {
-			if (copy_to_user(arg_user, &node, sizeof(node)) != 0)
-				return -EFAULT;
-			return 0;
-		}
-		return -ENOENT;
+		if (copy_to_user(arg_user, &node, sizeof(node)) != 0)
+			res = -EFAULT;
+		return res;
 	}
 	case KO_TEST_IOCTL_DEL: {
 		ko_test_node node;
+		char *key;
 
-		if (copy_from_user(&node, arg_user, sizeof(node)) != 0)
+		if (copy_from_user(&node, arg_user, sizeof(ko_test_node)) != 0)
 			return -EFAULT;
+		if ((res = load_key_user(&key, &node)) != 0)
+			return res;
 
 		mutex_lock(&data_lock);
-		res = ht_del_item(node.key);
+		res = ht_del_item(key, node.key_size);
 		mutex_unlock(&data_lock);
 		return res;
 	}
@@ -455,21 +602,37 @@ static long device_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned 
 	case KO_TEST_IOCTL_READ_NEXT: {
 		ko_test_node node;
 
-		mutex_lock(&data_lock);
-		if (!fd->locked)
-			res = -EBUSY;
-		else {
-			if (fd->pos != NULL) {
-				node.key = fd->pos->key;
-				node.value = fd->pos->value;
-				ht_read_next(&fd->bucket, &fd->pos);
-			}
-			else
-				res = -ENOENT;
-		}
-		mutex_unlock(&data_lock);
-		if (res == 0 && copy_to_user(arg_user, &node, sizeof(node)) != 0)
+		if (copy_from_user(&node, arg_user, sizeof(ko_test_node)) != 0)
 			return -EFAULT;
+
+		mutex_lock(&data_lock);
+		if (!fd->locked) {
+			mutex_unlock(&data_lock);
+			return -EBUSY;
+		}
+		if (fd->pos == NULL) {
+			mutex_unlock(&data_lock);
+			return -ENOENT;
+		}
+
+		if (node.value_size < fd->pos->value_size)
+			res = -ENOSPC;
+		if (node.key_size < fd->pos->key_size)
+			res = -ENOSPC;
+
+		if (res == 0) {
+			if (copy_to_user(node.key, fd->pos->key, fd->pos->key_size) != 0)
+				res = -EFAULT;
+			if (copy_to_user(node.value, fd->pos->value, fd->pos->value_size) != 0)
+				res = -EFAULT;
+		}
+		node.key_size = fd->pos->key_size;
+		node.value_size = fd->pos->value_size;
+		if (copy_to_user(arg_user, &node, sizeof(node)) != 0)
+			res = -EFAULT;
+		if (res == 0)
+			ht_read_next(&fd->bucket, &fd->pos);
+		mutex_unlock(&data_lock);
 		return res;
 	}
 	default:
@@ -495,7 +658,7 @@ static int device_release(struct inode *inode, struct file *file)
 	struct file_data *fd;
 
 	fd = (struct file_data *)file->private_data;
-	if (fd->locked)	{
+	if (fd->locked) {
 		mutex_lock(&data_lock);
 		device_write_locked = false;
 		mutex_unlock(&data_lock);
@@ -508,8 +671,7 @@ static int __init ko_test_init(void)
 {
 	int res = 0;
 	
-	pr_info("started, hash table size: %u\n", hash_table_size);
-	
+	pr_info("started\n");
 	major_number = register_chrdev(0, DEVICE_NAME, &file_ops);
 	if (major_number < 0) {
 		pr_err("failed to register a major number\n");
@@ -552,6 +714,8 @@ static int __init ko_test_init(void)
 		pr_err("failed to create hash table\n");
 		return res; 
 	}
+	pr_info("hash table size, specified %u, real %u\n", 
+		hash_table_size, ht_array_size);
 	return 0;
 }
 
@@ -572,10 +736,9 @@ module_exit(ko_test_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("George Stark");
 MODULE_DESCRIPTION("Test to get a job)");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3");
 
 // TODO:
-// move to string key /value
-// change hash function
 // try RCU
 // support block / nonblock mode, when try to change locked data
+// add collission counter
